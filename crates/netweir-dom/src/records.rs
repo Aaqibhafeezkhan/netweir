@@ -89,9 +89,7 @@ pub fn records(root: Node<'_>, base: Option<&Url>) -> Option<Records> {
             }
             let parent = css_path(rows[0].parent()?)?;
             let selector = if rows.len() > MAX_ROWS {
-                format!(
-                    "{parent} > {row_selector}:nth-child(-n+{MAX_ROWS} of {row_selector})"
-                )
+                format!("{parent} > {row_selector}:nth-child(-n+{MAX_ROWS} of {row_selector})")
             } else {
                 format!("{parent} > {row_selector}")
             };
