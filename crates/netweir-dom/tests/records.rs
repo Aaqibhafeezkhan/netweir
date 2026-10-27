@@ -482,6 +482,21 @@ fn odd_tags_are_escaped_in_the_row_selector() {
 }
 
 #[test]
+fn small_record_selector_has_no_nth_child() {
+    let rows: String = (0..3)
+        .map(|i| {
+            format!(
+                r#"<div class="row"><b class="name">Item {i}</b><i class="value">Value {i}</i></div>"#
+            )
+        })
+        .collect();
+    let html = format!("<main>{rows}</main>");
+    let r = read(&html).unwrap();
+    assert!(!r.selector.contains(":nth-child"), "{}", r.selector);
+    selectors_hold(&html, &r);
+}
+
+#[test]
 fn table_selector_stops_at_max_rows() {
     let rows: String = (0..5001)
         .map(|i| {

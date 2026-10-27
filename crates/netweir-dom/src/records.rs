@@ -87,7 +87,14 @@ pub fn records(root: Node<'_>, base: Option<&Url>) -> Option<Records> {
                 row_selector.push('.');
                 row_selector.push_str(&escape(c));
             }
-            let selector = limited_selector(&rows, &row_selector);
+            let parent = css_path(rows[0].parent()?)?;
+            let selector = if rows.len() > MAX_ROWS {
+                format!(
+                    "{parent} > {row_selector}:nth-child(-n+{MAX_ROWS} of {row_selector})"
+                )
+            } else {
+                format!("{parent} > {row_selector}")
+            };
             read_repeat(selector, &rows, base)
         }
     }
@@ -493,50 +500,6 @@ fn enough(n: usize, rows: usize) -> bool {
     n >= rows.min(2) && n as f64 >= KEEP * rows as f64
 }
 
-/// A selector for the first MAX_ROWS rows, using their actual sibling
-/// positions so unrelated elements between rows don't change the limit.
-fn limited_selector(rows: &[Node<'_>], row_selector: &str) -> String {
-    let mut parents: Vec<(Node<'_>, Vec<usize>)> = Vec::new();
-    for &row in rows.iter().take(MAX_ROWS) {
-        let Some(parent) = row.parent() else { continue };
-        let Some(position) = elements(parent).position(|child| child == row).map(|i| i + 1) else {
-            continue;
-        };
-        if let Some((_, positions)) = parents.iter_mut().find(|(p, _)| *p == parent) {
-            positions.push(position);
-        } else {
-            parents.push((parent, vec![position]));
-        }
-    }
-
-    parents
-        .into_iter()
-        .map(|(parent, positions)| {
-            let parent_path = css_path(parent).unwrap_or_else(|| "*".into());
-            let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for position in positions {
-                match ranges.last_mut() {
-                    Some((_, end)) if *end + 1 == position => *end = position,
-                    _ => ranges.push((position, position)),
-                }
-            }
-            ranges
-                .into_iter()
-                .map(|(start, end)| {
-                    let nth = if start == end {
-                        format!(":nth-child({start})")
-                    } else {
-                        format!(":nth-child(n+{start}):nth-child(-n+{end})")
-                    };
-                    format!("{parent_path} > {row_selector}{nth}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn read_table<'a>(table: Node<'a>, rows: &[Node<'a>], base: Option<&Url>) -> Records {
     let all: Vec<Node<'_>> = own_rows(table).collect();
     let laid = grid(&all);
@@ -669,8 +632,18 @@ fn read_table<'a>(table: Node<'a>, rows: &[Node<'a>], base: Option<&Url>) -> Rec
                 .collect()
         })
         .collect();
+    let at = css_path(table).unwrap_or_else(|| "table".into());
+    let row_selector = "tr:has(> td)";
+    // ponytail: the cap applies per row parent, so tables split across multiple tbody elements can exceed MAX_ROWS.
+    let selector = if rows.len() > MAX_ROWS {
+        format!(
+            "{at} > * > {row_selector}:nth-child(-n+{MAX_ROWS} of {row_selector}), {at} > {row_selector}:nth-child(-n+{MAX_ROWS} of {row_selector})"
+        )
+    } else {
+        format!("{at} > * > {row_selector}, {at} > {row_selector}")
+    };
     Records {
-        selector: limited_selector(rows, "tr:has(> td)"),
+        selector,
         columns: columns
             .into_iter()
             .zip(names)
