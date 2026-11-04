@@ -30,7 +30,15 @@ pub type Brands = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct LaunchOptions {
-    /// Chrome's executable; found with [`crate::find_chrome`] when None.
+    /// The browser to launch.
+    pub engine: Engine,
+    /// For Firefox: start it so pages can't tell it's driven, as Chrome
+    /// always is. That needs a Firefox `netweir install firefox`
+    /// installed. False drives any Firefox in automation mode instead,
+    /// where `navigator.webdriver` is true.
+    pub stealth: bool,
+    /// The browser's executable; found with [`crate::find_chrome`] or
+    /// [`crate::find_firefox`] when None.
     pub executable: Option<PathBuf>,
     pub headless: bool,
     /// More command-line switches for Chrome.
@@ -76,6 +84,8 @@ pub struct LaunchOptions {
 impl std::fmt::Debug for LaunchOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaunchOptions")
+            .field("engine", &self.engine)
+            .field("stealth", &self.stealth)
             .field("executable", &self.executable)
             .field("headless", &self.headless)
             .field("args", &self.args)
@@ -93,6 +103,8 @@ impl std::fmt::Debug for LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> LaunchOptions {
         LaunchOptions {
+            engine: Engine::Chrome,
+            stealth: true,
             executable: None,
             headless: true,
             args: Vec::new(),
@@ -105,6 +117,32 @@ impl Default for LaunchOptions {
             worker_header_order: false,
         }
     }
+}
+
+/// A browser Netweir drives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Engine {
+    #[default]
+    Chrome,
+    Firefox,
+}
+
+impl Engine {
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Chrome => "Chrome",
+            Engine::Firefox => "Firefox",
+        }
+    }
+}
+
+/// What a [`Browser`] is: which engine, its version, and whether pages
+/// can tell it's driven (`stealth` false: Firefox in automation mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineInfo {
+    pub engine: Engine,
+    pub version: String,
+    pub stealth: bool,
 }
 
 /// What every page says it is: the user agent without the headless
@@ -200,6 +238,15 @@ pub(crate) struct Inner {
     /// Chrome's own user agent and client hints, read the first time a
     /// page needs them, for a browser with no `identity`.
     own: tokio::sync::OnceCell<Option<Identity>>,
+    /// False only for a Firefox driven in automation mode.
+    pub stealth: bool,
+    /// Firefox's own user context, which its session is confined to (or
+    /// "default" in automation mode); None for Chrome.
+    pub default_context: Option<String>,
+    /// Where Firefox opened its first window, and its size (x, y, width,
+    /// height), and whether it's maximized: what each page's window
+    /// copies, as a person's would be.
+    pub first_window: Option<([i64; 4], bool)>,
 }
 
 /// The fields of an [`Inner`] that only a launch fills in.
@@ -312,6 +359,15 @@ async fn user_agent_of(browser: &Arc<Inner>, env: &Environment, own: &str) -> Re
 
 impl Browser {
     pub async fn launch(mut options: LaunchOptions) -> Result<Browser> {
+        if options.engine == Engine::Firefox {
+            return Browser::launch_firefox(options).await;
+        }
+        if !options.stealth {
+            return Err(Error::Invalid(
+                "stealth: false is for Firefox; Chrome is always launched as a person's browser"
+                    .into(),
+            ));
+        }
         options.args.extend(launch::env_switches());
         options.environment.validate()?;
         let executable = match options.executable.clone() {
@@ -495,6 +551,9 @@ impl Browser {
             own_languages: Mutex::default(),
             screens: tokio::sync::Mutex::new(()),
             own: tokio::sync::OnceCell::new(),
+            stealth: true,
+            default_context: None,
+            first_window: None,
         };
         let what = executable.display().to_string();
         // Google Chrome given its own default profile says so and runs on
@@ -509,12 +568,88 @@ impl Browser {
         }
     }
 
+    async fn launch_firefox(options: LaunchOptions) -> Result<Browser> {
+        options.environment.validate()?;
+        if options.environment != Environment::default() {
+            return Err(Error::Unsupported {
+                engine: "Firefox",
+                feature: "LaunchOptions.environment".into(),
+            });
+        }
+        // Each is Chrome's, or not done on Firefox yet: refused rather
+        // than quietly left out.
+        let given = [
+            ("LaunchOptions.proxy", options.proxy.is_some()),
+            ("LaunchOptions.brands", options.brands.is_some()),
+            (
+                "LaunchOptions.worker_header_order",
+                options.worker_header_order,
+            ),
+        ];
+        if let Some((feature, _)) = given.iter().find(|(_, given)| *given) {
+            return Err(Error::Unsupported {
+                engine: "Firefox",
+                feature: feature.to_string(),
+            });
+        }
+        // A Firefox dropped with this profile may still be quitting, and
+        // holds its lock until it has.
+        if let Some(dir) = &options.user_data_dir {
+            Quitting::wait_for(dir).await;
+        }
+        let started = crate::firefox::start(&options).await?;
+        let (environment, screen, screen_scale) = bare(&options);
+        let inner = Inner {
+            conn: started.conn,
+            child: Mutex::new(Some(started.process.child)),
+            lifeline: Mutex::new(Some(started.process.lifeline)),
+            profile: Some(started.profile),
+            keep_profile: options.user_data_dir.is_some(),
+            temp_profile: Mutex::new(started.temp),
+            contexts: Mutex::default(),
+            tracing_done: Arc::default(),
+            version: started.version,
+            identity: None,
+            timeout: options.timeout,
+            pause: options.dialog_pause,
+            proxy_login: None,
+            said: Some(started.process.said),
+            pages: Arc::default(),
+            attaching: Arc::default(),
+            downloads: Arc::default(),
+            environment,
+            arranges: options.headless,
+            screen,
+            screen_scale,
+            worker_header_order: false,
+            window_size: None,
+            agent: None,
+            own_languages: Mutex::default(),
+            screens: tokio::sync::Mutex::new(()),
+            own: tokio::sync::OnceCell::new(),
+            stealth: started.stealth,
+            default_context: Some(started.default_context),
+            first_window: started.first_window,
+        };
+        Ok(Browser {
+            inner: Arc::new(inner),
+        })
+    }
+
     /// Drives a browser that's already running: a `ws://` DevTools URL, as
     /// Chrome prints it, or an `http://host:port` whose `/json/version`
     /// names one. `options` give the timeout and the brands; nothing is
     /// launched. Closing it closes what netweir opened and leaves the
     /// browser running.
     pub async fn connect(url: &str, options: LaunchOptions) -> Result<Browser> {
+        // Every Firefox Netweir didn't start is in automation mode, and
+        // one it did start holds its one session already.
+        if options.engine == Engine::Firefox {
+            return Err(Error::Unsupported {
+                engine: "Firefox",
+                feature: "Browser.connect".into(),
+            });
+        }
         options.environment.validate()?;
         let (environment, screen, screen_scale) = bare(&options);
         let ws = if url.starts_with("http://") {
@@ -573,6 +708,9 @@ impl Browser {
             own_languages: Mutex::default(),
             screens: tokio::sync::Mutex::new(()),
             own: tokio::sync::OnceCell::new(),
+            stealth: true,
+            default_context: None,
+            first_window: None,
         };
         Browser::finish(inner, &options, &ws, None).await
     }
@@ -792,7 +930,23 @@ impl Browser {
         }))
     }
 
-    /// Chrome's product string, such as `Chrome/154.0.8037.98`.
+    /// Which browser this is, its version, and whether pages can tell
+    /// it's driven.
+    pub fn engine_info(&self) -> EngineInfo {
+        let engine = self.inner.engine();
+        let version = match engine {
+            Engine::Chrome => self.inner.version.split('/').nth(1).unwrap_or_default(),
+            Engine::Firefox => self.inner.version.trim_start_matches("Firefox/"),
+        };
+        EngineInfo {
+            engine,
+            version: version.to_string(),
+            stealth: self.inner.stealth,
+        }
+    }
+
+    /// The browser's product string, such as `Chrome/154.0.8037.98` or
+    /// `Firefox/159.0.1`.
     pub fn version(&self) -> &str {
         &self.inner.version
     }
@@ -851,7 +1005,9 @@ impl Browser {
         let env = env.over(&self.inner.environment);
         added_screen(&env, &self.inner.environment)?;
         if self.inner.keep_profile {
-            self.inner.allow_downloads(None).await?;
+            if self.inner.engine() == Engine::Chrome {
+                self.inner.allow_downloads(None).await?;
+            }
             return Page::open(self.inner.clone(), None, false, None, None, env).await;
         }
         let context = self.create_context().await?;
@@ -872,6 +1028,7 @@ impl Browser {
     /// to `guard` first, and one it refuses isn't fetched: navigating there
     /// fails with `ERR_BLOCKED_BY_CLIENT`.
     pub async fn new_guarded_page(&self, guard: Guard) -> Result<Page> {
+        self.inner.chrome_only("Browser.new_guarded_page")?;
         let context = self.create_context().await?;
         let env = self.inner.environment.clone();
         Page::open(
@@ -893,6 +1050,9 @@ impl Browser {
     /// [`Browser::new_context`], whose pages have `env` (over the
     /// browser's own environment) unless they say otherwise.
     pub async fn new_context_with(&self, env: Environment) -> Result<Context> {
+        if env != Environment::default() {
+            self.inner.chrome_only("a context's environment")?;
+        }
         let env = env.over(&self.inner.environment);
         env.validate()?;
         added_screen(&env, &self.inner.environment)?;
@@ -913,6 +1073,14 @@ impl Browser {
     }
 
     async fn create_context(&self) -> Result<String> {
+        if self.inner.engine() == Engine::Firefox {
+            // Netweir launched this Firefox, so the context goes with it.
+            let r = self
+                .inner
+                .call("", "browser.createUserContext", json!({}))
+                .await?;
+            return Ok(str_of(&r, "userContext"));
+        }
         // Gone when the connection is, however netweir lets go of it.
         let r = self
             .inner
@@ -948,6 +1116,7 @@ impl Browser {
         categories: Option<&[String]>,
         screenshots: bool,
     ) -> Result<()> {
+        self.inner.chrome_only("Browser.start_tracing")?;
         let mut included: Vec<&str> = match categories {
             Some(categories) => categories.iter().map(String::as_str).collect(),
             None => TRACE_CATEGORIES.to_vec(),
@@ -966,6 +1135,7 @@ impl Browser {
     /// Stops recording, and returns the trace: JSON that Chrome's Performance
     /// panel and Perfetto open.
     pub async fn stop_tracing(&self) -> Result<Vec<u8>> {
+        self.inner.chrome_only("Browser.stop_tracing")?;
         let inner = &self.inner;
         let (done, stream) = oneshot::channel();
         *inner.tracing_done.lock().unwrap_or_else(|e| e.into_inner()) = Some(done);
@@ -1035,7 +1205,7 @@ impl Browser {
         }
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            inner.conn.call("", "Browser.close", json!({})),
+            inner.conn.call("", inner.close_method(), json!({})),
         )
         .await;
         tokio::task::spawn_blocking(move || inner.shut_down(Duration::from_secs(10)))
@@ -1310,6 +1480,34 @@ impl Inner {
     }
 }
 
+impl Inner {
+    pub(crate) fn engine(&self) -> Engine {
+        match self.conn.dialect() {
+            crate::conn::Dialect::Cdp => Engine::Chrome,
+            crate::conn::Dialect::Bidi => Engine::Firefox,
+        }
+    }
+
+    /// What asks the browser to quit.
+    pub(crate) fn close_method(&self) -> &'static str {
+        match self.engine() {
+            Engine::Chrome => "Browser.close",
+            Engine::Firefox => "browser.close",
+        }
+    }
+
+    /// For what Netweir can't do on Firefox, or can't do there yet.
+    pub(crate) fn chrome_only(&self, feature: &str) -> Result<()> {
+        match self.engine() {
+            Engine::Chrome => Ok(()),
+            engine => Err(Error::Unsupported {
+                engine: engine.name(),
+                feature: feature.to_string(),
+            }),
+        }
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         // A profile to keep: Chrome is asked to quit, as close() asks, so
@@ -1326,7 +1524,7 @@ impl Drop for Inner {
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
         {
-            self.conn.send("", "Browser.close", json!({}));
+            self.conn.send("", self.close_method(), json!({}));
             self.conn.shut();
             let lifeline = self
                 .lifeline
@@ -1591,6 +1789,9 @@ async fn probe_identity(
             own_languages: Mutex::default(),
             screens: tokio::sync::Mutex::new(()),
             own: tokio::sync::OnceCell::new(),
+            stealth: true,
+            default_context: None,
+            first_window: None,
         }),
     };
     let what = executable.display().to_string();
@@ -1894,17 +2095,20 @@ impl Context {
         permissions: &[String],
         origin: Option<&str>,
     ) -> Result<()> {
+        self.browser.chrome_only("Context.grant_permissions")?;
         crate::page::grant(&self.browser, Some(&self.id), permissions, origin).await
     }
 
     /// Takes back every permission granted in the context.
     pub async fn clear_permissions(&self) -> Result<()> {
+        self.browser.chrome_only("Context.clear_permissions")?;
         crate::page::clear_permissions(&self.browser, Some(&self.id)).await
     }
 
     /// See [`Page::set_geolocation`]; for every page of the context, those
     /// open now and those opened later.
     pub async fn set_geolocation(&self, at: Option<Geolocation>) -> Result<()> {
+        self.browser.chrome_only("Context.set_geolocation")?;
         self.update(|e| e.geolocation = at);
         for page in self.rules.pages() {
             gone_is_fine(page.set_geolocation(at).await)?;
@@ -1914,6 +2118,7 @@ impl Context {
 
     /// See [`Page::set_offline`]; for every page of the context.
     pub async fn set_offline(&self, offline: bool) -> Result<()> {
+        self.browser.chrome_only("Context.set_offline")?;
         self.update(|e| e.offline = Some(offline));
         for page in self.rules.pages() {
             gone_is_fine(page.set_offline(offline).await)?;
@@ -1923,6 +2128,7 @@ impl Context {
 
     /// See [`Page::set_extra_headers`]; for every page of the context.
     pub async fn set_extra_headers(&self, headers: &[(String, String)]) -> Result<()> {
+        self.browser.chrome_only("Context.set_extra_headers")?;
         let mut env = self.environment();
         env.extra_headers = headers.to_vec();
         env.validate()?;
@@ -1935,6 +2141,7 @@ impl Context {
 
     /// See [`Page::add_init_script`]; for every page of the context.
     pub async fn add_init_script(&self, script: &str) -> Result<()> {
+        self.browser.chrome_only("Context.add_init_script")?;
         self.update(|e| e.init_scripts.push(script.to_string()));
         for page in self.rules.pages() {
             gone_is_fine(page.add_init_script(script).await)?;
@@ -1945,6 +2152,7 @@ impl Context {
     /// Like [`Page::route`], for every page of the context, those open
     /// now and those opened later. A page's own routes come first.
     pub async fn route(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Route>> {
+        self.browser.chrome_only("Context.route")?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::network::lock(&self.rules.rules).routes = Some(tx);
         self.refresh().await?;
@@ -1954,6 +2162,7 @@ impl Context {
     /// Stops the context's routing; requests waiting for a decision go on
     /// unchanged.
     pub async fn unroute(&self) -> Result<()> {
+        self.browser.chrome_only("Context.unroute")?;
         crate::network::lock(&self.rules.rules).routes = None;
         self.refresh().await
     }
@@ -1974,10 +2183,12 @@ impl Context {
     }
 
     pub async fn cookies(&self) -> Result<Vec<Cookie>> {
+        self.browser.chrome_only("Context.cookies")?;
         context_cookies(&self.browser, Some(&self.id)).await
     }
 
     pub async fn set_cookies(&self, cookies: &[Cookie]) -> Result<()> {
+        self.browser.chrome_only("Context.set_cookies")?;
         set_context_cookies(&self.browser, Some(&self.id), cookies).await
     }
 
@@ -1986,6 +2197,7 @@ impl Context {
     /// them. Each origin is read in a page opened for it, whose requests
     /// never leave Chrome.
     pub async fn storage_state(&self) -> Result<crate::StorageState> {
+        self.browser.chrome_only("Context.storage_state")?;
         let origins: Vec<String> = self
             .rules
             .origins
@@ -2000,20 +2212,20 @@ impl Context {
     /// Sets a storage state's cookies and localStorage in the context, as
     /// a new Playwright context made with `storage_state` has them.
     pub async fn set_storage_state(&self, state: &crate::StorageState) -> Result<()> {
+        self.browser.chrome_only("Context.set_storage_state")?;
         crate::storage::set_state(&self.browser, Some(&self.id), &self.rules.origins, state).await
     }
 
     /// Closes the context and every page in it.
     pub async fn close(&self) -> Result<()> {
-        match self
-            .browser
-            .call(
-                "",
+        let (method, params) = match self.browser.engine() {
+            Engine::Chrome => (
                 "Target.disposeBrowserContext",
                 json!({"browserContextId": self.id}),
-            )
-            .await
-        {
+            ),
+            Engine::Firefox => ("browser.removeUserContext", json!({"userContext": self.id})),
+        };
+        match self.browser.call("", method, params).await {
             Ok(_) | Err(Error::Closed) => Ok(()),
             // Already disposed.
             Err(Error::Protocol { .. }) => Ok(()),
@@ -2388,6 +2600,9 @@ mod tests {
             own_languages: Mutex::default(),
             screens: tokio::sync::Mutex::new(()),
             own: tokio::sync::OnceCell::new(),
+            stealth: true,
+            default_context: None,
+            first_window: None,
         });
         // A target that closes between being made and being attached to.
         std::thread::spawn(move || {

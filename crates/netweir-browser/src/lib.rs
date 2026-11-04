@@ -20,13 +20,13 @@ mod storage;
 mod uploads;
 mod window;
 
-pub use browser::{Brands, Browser, Context, Guard, LaunchOptions};
+pub use browser::{Brands, Browser, Context, Engine, EngineInfo, Guard, LaunchOptions};
 pub use environment::{
     ColorScheme, Contrast, Environment, ForcedColors, Geolocation, Media, MediaChange, Phone,
     ReducedMotion, Size, device_names,
 };
 pub use events::{Dialog, Download, PageEvent};
-pub use firefox::{find_firefox, firefox_executable, firefox_platform, prepare_firefox};
+pub use firefox::{find_firefox, firefox_executable, firefox_platform, prepare_firefox, user_js};
 pub use frame::{Frame, Pick, typing_time};
 pub use launch::{
     cft_executable, cft_platform, find_chrome, grant_sandbox_access, netweir_home,
@@ -87,6 +87,11 @@ pub enum Error {
     /// What was asked for is no longer there, such as the body of a
     /// response from before the page navigated.
     Gone(String),
+    /// The browser can't do this, or Netweir can't yet do it there.
+    Unsupported {
+        engine: &'static str,
+        feature: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -94,6 +99,9 @@ impl fmt::Display for Error {
         match self {
             Error::Launch(m) | Error::Script(m) | Error::Invalid(m) | Error::Gone(m) => {
                 f.write_str(m)
+            }
+            Error::Unsupported { engine, feature } => {
+                write!(f, "{feature} isn't available on {engine}")
             }
             Error::Navigation { url, error, said } => {
                 write!(f, "{url}: {error}")?;
