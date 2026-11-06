@@ -301,8 +301,23 @@ async fn at_origin(
     let result = async {
         let mut routes = page.route().await?;
         let answered = format!("{origin}/");
+        // Firefox tries an http site over https first, even for a POST,
+        // and stays on http when the https one sends it back there.
+        let upgraded = answered
+            .strip_prefix("http://")
+            .filter(|_| browser.engine() == crate::browser::Engine::Firefox)
+            .map(|rest| format!("https://{rest}"));
         tokio::spawn(async move {
             while let Some(route) = routes.recv().await {
+                if upgraded
+                    .as_deref()
+                    .is_some_and(|u| route.request().url.starts_with(u))
+                {
+                    let _ = route
+                        .fulfill(307, &[("Location".into(), answered.clone())], b"")
+                        .await;
+                    continue;
+                }
                 if !route.request().url.starts_with(&answered) {
                     let _ = route.abort().await;
                     continue;
@@ -337,6 +352,12 @@ async fn at_origin(
         page.evaluate(&js).await
     }
     .await;
+    // Closing lets go of its routes before Firefox closes the page, and a
+    // request it starts meanwhile, which no route then answers, would go
+    // on to the site: so nothing at all goes from here on.
+    if browser.engine() == crate::browser::Engine::Firefox {
+        let _ = page.block(&[], &["**".to_string()]).await;
+    }
     let _ = page.close().await;
     result
 }
