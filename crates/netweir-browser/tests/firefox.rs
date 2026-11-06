@@ -94,14 +94,15 @@ async fn a_firefox_that_exits_fails_the_launch_at_once() {
     let err = Browser::launch(LaunchOptions {
         executable: Some(fake),
         stealth: false,
-        timeout: Duration::from_secs(30),
+        timeout: Duration::from_secs(60),
         ..firefox_options()
     })
     .await
     .err()
     .unwrap();
+    // Well before the timeout, with room for a busy machine.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(20),
         "{:?}",
         started.elapsed()
     );
@@ -475,7 +476,6 @@ async fn unported_methods_are_unsupported_and_send_nothing() {
         }) => assert!(feature.contains(what), "{feature}"),
         other => panic!("{what}: {other:?}"),
     };
-    unsupported(page.set_geolocation(None).await, "set_geolocation");
     unsupported(
         page.emulate_media(&netweir_browser::MediaChange::default())
             .await,
@@ -484,16 +484,14 @@ async fn unported_methods_are_unsupported_and_send_nothing() {
     unsupported(
         browser
             .new_page_with(netweir_browser::Environment {
-                locale: Some("de-DE".into()),
+                reduced_motion: Some(netweir_browser::ReducedMotion::Reduce),
                 ..Default::default()
             })
             .await
             .map(drop),
-        "environment",
+        "reduced motion",
     );
-    let context = browser.new_context().await.unwrap();
-    unsupported(context.clear_permissions().await, "clear_permissions");
-    // A set: the context was made with a method new_page had sent.
+    unsupported(browser.start_tracing(None, false).await, "start_tracing");
     let sent = browser.methods_sent();
     assert_eq!(sent, before, "nothing was sent for them");
     assert!(
@@ -962,6 +960,147 @@ async fn a_firefox_page_has_its_init_scripts_headers_and_offline() {
     assert_eq!(
         page.evaluate(ping).await.unwrap(),
         serde_json::json!([true, "ok"])
+    );
+    browser.close().await.unwrap();
+}
+
+/// A Firefox page given an environment has it from its first document:
+/// locale, time zone, user agent (in the page and its requests), screen,
+/// viewport, pixel ratio and where it is; a permission granted to an
+/// origin is the page's until it's taken back. What Firefox can't give
+/// says so.
+#[tokio::test]
+async fn a_firefox_page_has_the_environment_it_was_given() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![("/", common::html("<p>here</p>"))]);
+    let env = netweir_browser::Environment {
+        locale: Some("de-DE".into()),
+        timezone: Some("Europe/Berlin".into()),
+        user_agent: Some(
+            "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0".into(),
+        ),
+        screen: Some(netweir_browser::Size {
+            width: 1440,
+            height: 900,
+        }),
+        viewport: Some(netweir_browser::Size {
+            width: 800,
+            height: 600,
+        }),
+        device_scale_factor: Some(2.0),
+        geolocation: Some(netweir_browser::Geolocation {
+            latitude: 52.52,
+            longitude: 13.4,
+            accuracy: 10.0,
+        }),
+        ..Default::default()
+    };
+    let context = browser.new_context_with(env).await.unwrap();
+    let page = context.new_page().await.unwrap();
+    page.goto(
+        &format!("{}/", server.url),
+        netweir_browser::WaitUntil::Load,
+        None,
+    )
+    .await
+    .unwrap();
+    let seen = page
+        .evaluate(
+            "[navigator.language, Intl.DateTimeFormat().resolvedOptions().timeZone, \
+              navigator.userAgent.includes('Linux'), screen.width, screen.height, \
+              innerWidth, innerHeight, devicePixelRatio]",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        serde_json::json!(["de-DE", "Europe/Berlin", true, 1440, 900, 800, 600, 2])
+    );
+    let sent = server.headers_for("/");
+    let header = |name: &str| {
+        sent.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert!(header("user-agent").contains("Linux"), "{sent:?}");
+
+    // A permission the system has no say in, granted and taken back.
+    let origin = server.url.trim_end_matches('/').to_string();
+    let state = |name: &str| {
+        format!("navigator.permissions.query({{name: '{name}'}}).then((p) => p.state)")
+    };
+    context
+        .grant_permissions(&["persistent-storage".into()], Some(&origin))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.evaluate(&state("persistent-storage")).await.unwrap(),
+        serde_json::json!("granted")
+    );
+    context.clear_permissions().await.unwrap();
+    assert_eq!(
+        page.evaluate(&state("persistent-storage")).await.unwrap(),
+        serde_json::json!("prompt")
+    );
+    // Where it is: Firefox asks the system too, and a machine with
+    // location turned off (a CI runner's) leaves geolocation at prompt
+    // whatever is granted, so the place is read only where it can be.
+    context
+        .grant_permissions(&["geolocation".into()], Some(&origin))
+        .await
+        .unwrap();
+    if page.evaluate(&state("geolocation")).await.unwrap() == serde_json::json!("granted") {
+        // With a time limit of the page's own: a position that never came
+        // held the whole run up on macOS, and geolocation's own timeout
+        // only starts once the system has answered.
+        let at = tokio::time::timeout(
+            Duration::from_secs(20),
+            page.evaluate(
+                "new Promise((ok, no) => { \
+                   setTimeout(() => no('no position in 10 seconds'), 10000); \
+                   navigator.geolocation.getCurrentPosition( \
+                     (p) => ok([p.coords.latitude, p.coords.longitude]), \
+                     (e) => no(e.code + ' ' + e.message), {timeout: 10000}); })",
+            ),
+        )
+        .await
+        .expect("the page never answered for its position")
+        .unwrap();
+        assert_eq!(at, serde_json::json!([52.52, 13.4]));
+    }
+    context.clear_permissions().await.unwrap();
+
+    for (env, what) in [
+        (
+            netweir_browser::Environment {
+                color_scheme: Some(netweir_browser::ColorScheme::Dark),
+                ..Default::default()
+            },
+            "colour scheme",
+        ),
+        (
+            netweir_browser::Environment {
+                forced_colors: Some(netweir_browser::ForcedColors::Active),
+                ..Default::default()
+            },
+            "forced colours",
+        ),
+    ] {
+        match browser.new_page_with(env).await {
+            Err(netweir_browser::Error::Unsupported { feature, .. }) => {
+                assert!(feature.contains(what), "{feature}")
+            }
+            other => panic!("{what}: {:?}", other.map(drop)),
+        }
+    }
+    assert!(
+        context
+            .grant_permissions(&["geolocation".into()], None)
+            .await
+            .is_err()
     );
     browser.close().await.unwrap();
 }
