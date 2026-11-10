@@ -234,9 +234,7 @@ impl Frame {
         match self.run(Some(id), expression, true).await {
             // The document changed under it, or the frame moved to another
             // process; once more in the new one.
-            Err(Error::Protocol { message, .. })
-                if message.contains("context") || !self.is_main() =>
-            {
+            Err(Error::Protocol { message, .. }) if replaced(&message) || !self.is_main() => {
                 let id = self.world(true).await?;
                 self.run(Some(id), expression, true).await
             }
@@ -893,27 +891,46 @@ impl Frame {
         // Whatever draws it may wait on the page's next frame, which a
         // tab behind never gets.
         self.page.to_view().await?;
-        let call = format!("__netweir.state({})", Value::from(selector));
-        let mut pause = Duration::from_millis(20);
+        let wanted = match state {
+            "attached" => json!(["hidden", "visible"]),
+            "visible" => json!(["visible"]),
+            "hidden" => json!(["hidden", "detached"]),
+            _ => json!(["detached"]),
+        };
+        // The page looks every frame, so the wait ends on the frame that
+        // shows the change. It answers at least once a second, so a
+        // navigation that replaces the document is waited past here.
         loop {
-            let now = self.helper(&call).await?;
-            let now = now.as_str().unwrap_or("detached");
-            let done = match state {
-                "attached" => now != "detached",
-                "visible" => now == "visible",
-                "hidden" => now != "visible",
-                _ => now == "detached",
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = format!(
+                "__netweir.stateIn({}, {wanted}, {})",
+                Value::from(selector),
+                left.min(Duration::from_secs(1)).as_millis()
+            );
+            let now = match self.helper(&call).await {
+                Ok(now) => now,
+                // A wait can outlast documents: one that went during the
+                // call, and its replacement before the helper got there,
+                // is waited past as the next document is asked.
+                Err(Error::Protocol { message, .. })
+                    if replaced(&message) && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
-            if done {
+            if wanted
+                .as_array()
+                .is_some_and(|w| w.contains(&now.as_str().map_or(json!("detached"), Value::from)))
+            {
                 return Ok(());
             }
-            if Instant::now() + pause >= deadline {
+            if Instant::now() >= deadline {
                 return Err(Error::Timeout(format!(
                     "waiting for {selector} to be {state}"
                 )));
             }
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(Duration::from_millis(200));
         }
     }
 
@@ -1417,6 +1434,12 @@ fn never(check: &str) -> &'static str {
         "receives events" => "something else was always at its centre, covering it",
         _ => "it never became actionable",
     }
+}
+
+/// Whether Chrome said a script's document went while it ran: its world
+/// went with it, or the frame navigated.
+fn replaced(message: &str) -> bool {
+    message.contains("context") || message.contains("navigated")
 }
 
 #[cfg(test)]
